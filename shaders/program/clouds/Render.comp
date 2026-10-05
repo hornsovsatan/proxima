@@ -1,0 +1,96 @@
+/*
+--------------------------------------------------------------------------------
+
+	Shaders Shaders
+
+	Copyright (C) 2024 None
+	Apache License 2.0
+
+	Pass: Compute clouds
+
+--------------------------------------------------------------------------------
+*/
+
+//======// Utility //=============================================================================//
+
+#include "/lib/Utility.glsl"
+
+//======// Input //===============================================================================//
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+#ifndef CLOUD_TAAU_ENABLED
+	const vec2 workGroupsRender = vec2(1.0, 1.0);
+#elif CLOUD_TAAU_SCALE == 2
+	const vec2 workGroupsRender = vec2(0.5, 0.5);
+#elif CLOUD_TAAU_SCALE == 3
+	const vec2 workGroupsRender = vec2(0.333333, 0.333333);
+#elif CLOUD_TAAU_SCALE == 4
+	const vec2 workGroupsRender = vec2(0.25, 0.25);
+#endif
+
+//======// Uniform //=============================================================================//
+
+writeonly uniform image2D cloudOriginImg;
+writeonly uniform image2D cloudDepthOriginImg;
+
+#include "/lib/universal/Uniform.glsl"
+
+//======// SSBO //================================================================================//
+
+#include "/lib/universal/SSBO.glsl"
+
+//======// Function //============================================================================//
+
+#include "/lib/universal/Random.glsl"
+#include "/lib/universal/Transform.glsl"
+
+#include "/lib/atmosphere/Common.glsl"
+#include "/lib/atmosphere/Bruneton08.glsl"
+
+#include "/lib/atmosphere/clouds/Render.glsl"
+
+float SampleDepthMax4x4(in sampler2D depthTex, in vec2 coord) {
+	// 4x4 pixel neighborhood using textureGatherOffset
+	float LL = maxOf(textureGatherOffset(depthTex, coord, ivec2(-2, -2)));
+	float LR = maxOf(textureGatherOffset(depthTex, coord, ivec2(-2,  2)));
+	float UL = maxOf(textureGatherOffset(depthTex, coord, ivec2( 2, -2)));
+	float UR = maxOf(textureGatherOffset(depthTex, coord, ivec2( 2,  2)));
+
+	return max(max(LL, LR), max(UL, UR));
+}
+
+//======// Main //================================================================================//
+void main() {
+    ivec2 screenTexel = ivec2(gl_GlobalInvocationID.xy);
+	vec2 screenCoord = texelToUv(screenTexel);
+
+	#ifdef CLOUD_TAAU_ENABLED
+		vec2 renderCoord = (screenCoord + taaOffset * 0.5) * CLOUD_TAAU_SCALE;
+		ivec2 renderTexel = uvToTexel(renderCoord);
+	#else
+		#define renderCoord screenCoord
+		#define renderTexel screenTexel
+	#endif
+
+	vec4 cloudOut = vec4(0.0, 0.0, 0.0, 1.0);
+	float cloudDepth = -1.0;
+
+	float depthMax = SampleDepthMax4x4(depthtex2, renderCoord);
+
+	#if defined DISTANT_HORIZONS
+		if (depthMax > 1.0 - EPS) depthMax = SampleDepthMax4x4(dhDepthTex1, renderCoord);
+	#endif
+
+	if (depthMax > 1.0 - EPS) {
+		vec2 noise = SampleStbnVec2(renderTexel, frameCounter + 11);
+
+		vec3 viewDir  = ScreenToViewVectorRaw(renderCoord);
+		vec3 worldDir = mat3(gbufferModelViewInverse) * viewDir;
+
+		cloudOut = RenderClouds(worldDir, noise, cloudDepth);
+	}
+
+	imageStore(cloudOriginImg, screenTexel, cloudOut);
+	imageStore(cloudDepthOriginImg, screenTexel, vec4(cloudDepth));
+}
