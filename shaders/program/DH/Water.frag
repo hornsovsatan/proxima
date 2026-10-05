@@ -1,0 +1,96 @@
+
+#define PASS_DH_WATER
+
+//======// Utility //=============================================================================//
+
+#include "/lib/Utility.glsl"
+
+//======// Output //==============================================================================//
+
+/* RENDERTARGETS: 7,8,12 */
+layout (location = 0) out uvec4 gbufferOut0;
+layout (location = 1) out vec4 gbufferOut1;
+layout (location = 2) out vec4 waterOut;
+
+//======// Uniform //=============================================================================//
+
+#include "/lib/universal/Uniform.glsl"
+
+//======// SSBO //================================================================================//
+
+#include "/lib/universal/SSBO.glsl"
+
+//======// Input //===============================================================================//
+
+flat in vec3 flatNormal;
+
+in vec4 vertColor;
+in vec2 lightmap;
+flat in uint materialID;
+
+in vec3 worldPos;
+
+//======// Function //============================================================================//
+
+#include "/lib/universal/Transform.glsl"
+#include "/lib/universal/Random.glsl"
+
+#define PHYSICS_OCEAN_SUPPORT
+
+#ifdef PHYSICS_OCEAN
+	#define PHYSICS_FRAGMENT
+	#include "/lib/water/PhysicsOceans.glsl"
+#else
+	#include "/lib/water/WaterWave.glsl"
+#endif
+
+//======// Main //================================================================================//
+void main() {
+	ivec2 texel = ivec2(gl_FragCoord.xy);
+    if (loadDepth0(texel) < 1.0) { discard; return; }
+
+	vec3 worldNormal;
+	gbufferOut0.z = Packup2x8U(OctEncodeUnorm(flatNormal));
+
+	if (materialID == 3u) { // water
+		vec3 worldDir = normalize(worldPos - gbufferModelViewInverse[3].xyz);
+
+		#ifdef PHYSICS_OCEAN
+			WavePixelData wave = physics_wavePixel(physics_localPosition.xz, physics_localWaviness, physics_iterationsNormal, physics_gameTime);
+
+			worldNormal = wave.normal;
+		#else
+			const mat3 tbnMatrix = mat3(
+				vec3(1.0, 0.0, 0.0),
+				vec3(0.0, 0.0, 1.0),
+				vec3(0.0, 1.0, 0.0)
+			);
+
+			vec3 minecraftPos = worldPos + cameraPosition;
+			#ifdef WATER_PARALLAX
+				float dither = SampleStbnVec1(texel, frameCounter + 5);
+				worldNormal = CalculateWaterNormal(minecraftPos, worldDir * tbnMatrix, dither);
+			#else
+				worldNormal = CalculateWaterNormal(minecraftPos);
+			#endif
+
+			worldNormal = tbnMatrix * worldNormal;
+		#endif
+
+		float depth1 = loadDepth1DH(texel);
+		vec3 viewPos1 = ScreenToViewSpace(vec3(gl_FragCoord.xy * viewPixelSize, depth1));
+		vec3 worldPos1 = transMAD(gbufferModelViewInverse, viewPos1);
+
+		vec2 encodedNormal = OctEncodeUnorm(worldNormal);
+		gbufferOut0.w = Packup2x8U(encodedNormal);
+
+		waterOut = vec4(distance(worldPos, worldPos1) * r255, Packup2x8(encodedNormal), 0.0, 1.0);
+	} else {
+		gbufferOut1 = vertColor;
+		gbufferOut0.w = gbufferOut0.z;
+		waterOut = vec4(0.0);
+	}
+
+	gbufferOut0.x = PackupDithered2x8U(lightmap, bayer4(gl_FragCoord.xy));
+	gbufferOut0.y = materialID;
+}
