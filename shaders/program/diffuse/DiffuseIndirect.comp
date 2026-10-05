@@ -1,0 +1,81 @@
+/*
+--------------------------------------------------------------------------------
+
+	Shaders Shaders
+
+	Copyright (C) 2024 None
+	Apache License 2.0
+
+	Pass: Compute diffuse indirect lighting
+
+--------------------------------------------------------------------------------
+*/
+
+//======// Input //===============================================================================//
+
+layout (local_size_x = 16, local_size_y = 16) in;
+const vec2 workGroupsRender = vec2(0.5, 0.5);
+
+//======// Utility //=============================================================================//
+
+#include "/lib/Utility.glsl"
+
+//======// Uniform //=============================================================================//
+
+writeonly restrict uniform image2D colorimg3;
+
+#include "/lib/universal/Uniform.glsl"
+
+//======// SSBO //================================================================================//
+
+#include "/lib/universal/SSBO.glsl"
+
+//======// Function //============================================================================//
+
+#include "/lib/universal/Transform.glsl"
+#include "/lib/universal/Fetch.glsl"
+#include "/lib/universal/Random.glsl"
+
+#include "/lib/atmosphere/Common.glsl"
+
+#include "/lib/surface/BRDF.glsl"
+#include "/lib/lighting/SSILVB.glsl"
+
+float GetClosestDepth(in ivec2 texel) {
+    float depth = loadDepth0(texel);
+
+    for (uint i = 0u; i < 8u; ++i) {
+        ivec2 sampleTexel = (offset3x3N[i] << 1) + texel;
+        float sampleDepth = loadDepth0(sampleTexel);
+        depth = min(depth, sampleDepth);
+    }
+
+    return depth;
+}
+
+//======// Main //================================================================================//
+void main() {
+	ivec2 screenTexel = ivec2(gl_GlobalInvocationID.xy);
+
+    ivec2 currentTexel = screenTexel << 1;
+	float depth = GetClosestDepth(currentTexel);
+	// float depth = loadDepth0(currentTexel);
+	#if defined DISTANT_HORIZONS
+		bool dhTerrainMask = depth > 1.0 - EPS;
+		if (dhTerrainMask) depth = loadDepth0DH(currentTexel);
+	#endif
+
+	if (depth < 1.0) {
+		#if defined DISTANT_HORIZONS
+            if (dhTerrainMask) depth = ViewToScreenDepth(ScreenToViewDepthDH(depth));
+		#endif
+		uvec4 gbufferData0 = loadGbufferData0(currentTexel);
+		vec3 worldNormal = FetchWorldNormal(gbufferData0);
+
+    	vec2 screenCoord = texelToUv(currentTexel);
+		vec3 viewPos = ScreenToViewSpace(vec3(screenCoord, depth));
+
+		vec2 lightmap = Unpack2x8U(gbufferData0.x);
+		imageStore(colorimg3, screenTexel, CalculateSSILVB(screenCoord, viewPos, worldNormal, lightmap));
+	}
+}
