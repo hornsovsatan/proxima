@@ -1,0 +1,240 @@
+/*
+--------------------------------------------------------------------------------
+
+	Shaders Shaders
+
+	Copyright (C) 2024 None
+	Apache License 2.0
+
+	Pass: Post-processing compositing
+
+--------------------------------------------------------------------------------
+*/
+
+//======// Input //===============================================================================//
+
+layout (local_size_x = 16, local_size_y = 16) in;
+const vec2 workGroupsRender = vec2(1.0, 1.0);
+
+//======// Utility //=============================================================================//
+
+#include "/lib/Utility.glsl"
+
+#define TONE_MAPPER AgX_Minimal // [None AcademyFit AcademyFull AgX_Minimal AgX_Full Uchimura Lottes]
+
+#define BLOOM_INTENSITY 1.0 // Intensity of bloom. [0.0 0.01 0.02 0.05 0.07 0.1 0.15 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 2.0 3.0 4.0 5.0 7.0 10.0 15.0 20.0]
+#define BLOOMY_FOG_INTENSITY 0.75 // Intensity of bloomy fog. [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.75 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 2.0 2.5 3.0 3.5 4.0 5.0]
+
+#define PURKINJE_SHIFT // Enables purkinje shift effect
+#define PURKINJE_SHIFT_STRENGTH 0.5 // Strength of purkinje shift effect. [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 2.0 2.5 3.0 3.5 4.0 5.0]
+
+// #define VIGNETTE_ENABLED // Enables vignetting effect
+#define VIGNETTE_STRENGTH 1.0 // Strength of vignetting effect. [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 2.0 2.5 3.0 3.5 4.0 5.0]
+#define VIGNETTE_ROUNDNESS 0.5 // Roundness of vignetting effect. [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9 2.0 2.5 3.0 3.5 4.0 5.0]
+
+//======// Uniform //=============================================================================//
+
+writeonly uniform image2D colorimg0; // LDR output
+
+uniform sampler2D colortex0; // Motion blur output
+uniform sampler2D colortex1; // TAA output
+uniform sampler2D colortex4; // Bloom tiles
+uniform sampler2D colortex6; // Rain alpha
+uniform sampler2D colortex12; // Bloomy fog mask
+
+uniform sampler2D skyMapTex;
+
+uniform float aspectRatio;
+uniform float rainStrength;
+
+uniform vec2 viewPixelSize;
+
+//======// SSBO //================================================================================//
+
+#include "/lib/universal/SSBO.glsl"
+
+//======// Function //============================================================================//
+
+const vec2 bloomTileOffset[7] = vec2[7](
+	vec2(0.0000, 0.0000),
+	vec2(0.0000, 0.5000),
+	vec2(0.2500, 0.5000),
+	vec2(0.2500, 0.6250),
+	vec2(0.3125, 0.6250),
+	vec2(0.3150, 0.6563),
+	vec2(0.3281, 0.6563)
+);
+
+void CombineBloomAndFog(inout vec3 scene, in ivec2 texel, in float exposure) {
+	vec3 bloomData = vec3(0.0);
+	vec2 screenCoord = texelToUv(texel);
+
+	float weight = 1.0;
+	float sumWeight = 0.0;
+
+	vec2 upscalingCoord = screenCoord;
+	for (uint i = 0u; i < 7u; ++i) {
+		upscalingCoord *= 0.5;
+    	vec2 sampleCoord = upscalingCoord + bloomTileOffset[i];
+		sampleCoord += viewPixelSize * float(i * 12);
+		vec3 sampleTile = textureBicubic(colortex4, sampleCoord).rgb;
+
+		bloomData += sampleTile * weight;
+		sumWeight += weight;
+		weight *= 0.85;
+	}
+
+	bloomData *= rcp(sumWeight);
+
+	float bloomIntensity = BLOOM_INTENSITY * 0.075;
+	bloomIntensity *= fma(1.0 / max(exposure, 1.0), 0.75, 0.25);
+
+	scene = mix(scene, bloomData, bloomIntensity);
+
+	#ifdef BLOOMY_FOG
+		float mask = texelFetch(colortex12, texel, 0).x;
+		scene = mix(bloomData, scene, mix(1.0, saturate(mask), BLOOMY_FOG_INTENSITY));
+	#endif
+
+	if (rainStrength > 1e-2) {
+		float rainAlpha = textureBicubic(colortex6, screenCoord).a;
+		rainAlpha = oms(rainAlpha) * RAIN_VISIBILITY;
+		scene = scene * oms(rainAlpha) + bloomData * rainAlpha * 1.25;
+	}
+}
+
+//================================================================================================//
+
+const mat3 sRGBtoXYZ = mat3(
+	vec3(0.4124564, 0.3575761, 0.1804375),
+	vec3(0.2126729, 0.7151522, 0.0721750),
+	vec3(0.0193339, 0.1191920, 0.9503041)
+);
+
+const mat3 XYZtoSRGB = mat3(
+	vec3(3.2409699419, 	-1.5373831776, -0.4986107603),
+	vec3(-0.9692436363,  1.8759675015,  0.0415550574),
+	vec3(0.0556300797, 	-0.2039769589,  1.0569715142)
+);
+
+// See section 3.4 of http://www.diva-portal.org/smash/get/diva2:24136/FULLTEXT01.pdf
+vec3 PurkinjeShift(in vec3 image) {
+	const vec3 rodResponse = vec3(0.05, 0.55, 0.60);
+
+	vec3 xyz = image * sRGBtoXYZ;
+	vec3 scotopic = xyz * max0(1.33 * (1.0 + (xyz.y + xyz.z) / xyz.x) - 1.68);
+
+	float rodLuminance = dot(scotopic * XYZtoSRGB, rodResponse);
+	return mix(image, rodLuminance * vec3(0.56, 0.72, 1.0), exp2(-(16.0 / PURKINJE_SHIFT_STRENGTH) * rodLuminance));
+}
+
+vec3 None(in vec3 x) {
+	return linearToSRGB(x);
+}
+
+// Uchimura 2017, "HDR theory and practice"
+// Math: https://www.desmos.com/calculator/gslcdxvipg
+// Source: https://www.slideshare.net/nikuque/hdr-theory-and-practicce-jp
+vec3 Uchimura(in vec3 x) {
+    const float maxDisplayBrightness = 1.0;
+    const float contrast			 = 1.0;
+    const float linearStart			 = 0.2;
+    const float linearLength		 = 0.1;
+    const float black				 = 1.33;
+    const float pedestal			 = 0.0;
+
+    const float l0 = ((maxDisplayBrightness - linearStart) * linearLength) / contrast;
+    const float L0 = linearStart - linearStart / contrast;
+    const float L1 = linearStart + oms(linearStart) / contrast;
+    const float S0 = linearStart + l0;
+    const float S1 = linearStart + contrast * l0;
+    const float C2 = contrast * maxDisplayBrightness / (maxDisplayBrightness - S1);
+    const float CP = -1.44269502 * C2 / maxDisplayBrightness;
+
+    vec3 w0 = 1.0 - smoothstep(0.0, linearStart, x);
+    vec3 w2 = step(S0, x);
+    vec3 w1 = 1.0 - w0 - w2;
+
+    vec3 T = pow(x, vec3(black)) / pow(linearStart, black - 1.0) + pedestal;
+    vec3 S = maxDisplayBrightness - (maxDisplayBrightness - S1) * exp2(CP * (x - S0));
+    vec3 L = linearStart + contrast * (x - linearStart);
+
+    x = T * w0 + L * w1 + S * w2;
+
+	return linearToSRGB(x);
+}
+
+// Lottes 2016, "Advanced Techniques and Optimization of HDR Color Pipelines"
+// https://gpuopen.com/wp-content/uploads/2016/03/GdcVdrLottes.pdf
+vec3 Lottes(in vec3 x) {
+	x *= 2.0;
+
+	const vec3 a      = vec3(1.35);
+	const vec3 d      = vec3(0.92);
+	const vec3 hdrMax = vec3(8.0);
+	const vec3 midIn  = vec3(0.2);
+	const vec3 midOut = vec3(0.3);
+
+	const vec3 ad = a * d;
+	const vec3 curvedMidIn = pow(midIn, a);
+	const vec3 curvedHdrMax = pow(hdrMax, a);
+	const vec3 b = -curvedMidIn + curvedHdrMax * midOut;
+	const vec3 c = pow(hdrMax, ad) * curvedMidIn - curvedHdrMax * pow(midIn, ad) * midOut;
+
+	return pow(x, a) * (pow(hdrMax, ad) - pow(midIn, ad)) * midOut / (pow(x, ad) * b + c);
+}
+
+#include "/lib/post/ACES.glsl"
+#include "/lib/post/AgX.glsl"
+
+//======// Main //================================================================================//
+void main() {
+    ivec2 screenTexel = ivec2(gl_GlobalInvocationID.xy);
+
+ 	#if EXPOSURE_MODE == MANUAL
+		float exposure = exp2(-MANUAL_EV);
+	#else
+		float exposure = global.exposure.value;
+	#endif
+
+	#ifdef MOTION_BLUR
+		vec3 HDRImage = texelFetch(colortex0, screenTexel, 0).rgb;
+	#else
+		vec3 HDRImage = texelFetch(colortex1, screenTexel, 0).rgb;
+	#endif
+
+	// Bloom and fog
+	#ifdef BLOOM_ENABLED
+		CombineBloomAndFog(HDRImage, screenTexel, exposure);
+	#endif
+
+	// Apply exposure
+	HDRImage *= exposure;
+
+	// Purkinje shift
+	#ifdef PURKINJE_SHIFT
+		HDRImage = PurkinjeShift(HDRImage);
+	#endif
+
+	// Vignetting
+	#ifdef VIGNETTE_ENABLED
+		vec2 clipCoord = texelToUv(screenTexel) * 2.0 - 1.0;
+		clipCoord.x *= mix(1.0, aspectRatio, VIGNETTE_ROUNDNESS);
+		HDRImage *= exp2(-0.5 * sdot(clipCoord) * VIGNETTE_STRENGTH);
+	#endif
+
+	// Debug sky environment map
+	#ifdef DEBUG_SKY_MAP
+		if (all(lessThan(screenTexel, skyMapRes))) {
+			HDRImage = texelFetch(skyMapTex, screenTexel, 0).rgb;
+		}
+	#endif
+
+	// Tone mapping
+	vec3 LDRImage = TONE_MAPPER(HDRImage);
+
+	// LDR range clamp
+	LDRImage = saturate(LDRImage);
+
+	imageStore(colorimg0, screenTexel, vec4(sRGBtoLinearApprox(LDRImage), 1.0));
+}
